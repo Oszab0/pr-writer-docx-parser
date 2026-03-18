@@ -147,3 +147,24 @@ def review_document(payload: ReviewRequest):
         "filename_valid": filename_valid,
         "target_valid": target_valid
     }
+    
+@app.post("/rebuild-document")
+async def rebuild_document(
+    file: UploadFile = File(...),
+    revisions_json: str = File(...)
+):
+    content = await file.read()
+
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty DOCX file")
+
+    if not revisions_json:
+        raise HTTPException(status_code=400, detail="Missing revisions_json")
+
+    return {
+        "ok": True,
+        "message": "Rebuild endpoint reached successfully.",
+        "input_file_name": file.filename,
+        "revisions_json_received": True,
+        "input_file_size": len(content)
+    }
