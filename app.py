@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
+from typing import List
 import zipfile
 import io
 from lxml import etree
@@ -97,6 +98,23 @@ class ReviewRequest(BaseModel):
     status_out: str
     source_file_name: str
     target_file_name: str
+
+
+# ----------------------------
+# AI Revision schema
+# ----------------------------
+
+class RevisionItem(BaseModel):
+    comment_id: str
+    original_text: str
+    editor_comment: str
+    revised_text: str
+    change_type: str
+    review_comment: str
+
+
+class RebuildRequest(BaseModel):
+    revisions: List[RevisionItem]
 
 
 # ----------------------------
