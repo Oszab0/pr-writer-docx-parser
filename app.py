@@ -1,191 +1,400 @@
-import os
-import tempfile
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from typing import List
 import zipfile
-from flask import Flask, request, send_file, jsonify
+import io
+import json
 from lxml import etree
-import openai
 
-app = Flask(__name__)
+app = FastAPI(title="PR Writer DOCX Parser")
 
-openai.api_key = os.environ.get("OPENAI_API_KEY")
-
-NS = {
-    "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-}
+NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
 
-# -----------------------------
-# DOCX extraction
-# -----------------------------
+# ----------------------------
+# Health / root
+# ----------------------------
 
-def extract_docx_xml(docx_path):
-    with zipfile.ZipFile(docx_path) as z:
-        xml_content = z.read("word/document.xml")
-
-    return etree.fromstring(xml_content)
+@app.get("/")
+def root():
+    return {"status": "PR Writer DOCX parser running"}
 
 
-# -----------------------------
-# Collect paragraphs
-# -----------------------------
+@app.get("/health")
+def health():
+    return {"ok": True, "service": "pr-writer-docx-parser"}
 
-def collect_paragraphs(xml_root):
 
+# ----------------------------
+# Helpers
+# ----------------------------
+
+def get_text_from_element(element) -> str:
+    texts = element.findall(".//w:t", NS)
+    return "".join([t.text for t in texts if t.text]).strip()
+
+
+def extract_paragraphs(doc_tree) -> list[dict]:
     paragraphs = []
+    p_nodes = doc_tree.findall(".//w:p", NS)
 
-    for p in xml_root.findall(".//w:p", NS):
-
-        texts = p.findall(".//w:t", NS)
-
-        full_text = "".join([t.text for t in texts if t.text])
-
-        if full_text.strip():
-
+    for idx, p in enumerate(p_nodes):
+        text = get_text_from_element(p)
+        if text:
             paragraphs.append({
-                "element": p,
-                "text": full_text
+                "paragraph_index": idx,
+                "text": text,
+                "element": p
             })
 
     return paragraphs
 
 
-# -----------------------------
-# GPT rewrite
-# -----------------------------
+def extract_comment_texts(docx) -> dict:
+    comments = {}
 
-def rewrite_with_gpt(text):
+    if "word/comments.xml" not in docx.namelist():
+        return comments
 
-    prompt = f"""
-Rewrite this press release paragraph according to PR standards.
+    comments_xml = docx.read("word/comments.xml")
+    tree = etree.fromstring(comments_xml)
 
-Keep the meaning but improve clarity, flow and media style.
+    for c in tree.findall(".//w:comment", NS):
+        cid = c.get(f"{{{W_NS}}}id")
+        comment_text = get_text_from_element(c)
+        comments[cid] = {
+            "comment_id": cid,
+            "comment_text": comment_text
+        }
 
-Text:
-{text}
-"""
-
-    response = openai.ChatCompletion.create(
-        model="gpt-5",
-        messages=[
-            {"role": "system", "content": "You are a professional PR editor."},
-            {"role": "user", "content": prompt}
-        ]
-    )
-
-    return response.choices[0].message.content.strip()
+    return comments
 
 
-# -----------------------------
-# Write text into paragraph
-# -----------------------------
+def extract_comment_targets(paragraphs, comments) -> tuple[dict, list]:
+    mapped = {}
+    unmapped = []
 
-def write_text_to_paragraph(paragraph_element, new_text):
+    for p in paragraphs:
+        starts = p["element"].findall(".//w:commentRangeStart", NS)
 
+        for start in starts:
+            cid = start.get(f"{{{W_NS}}}id")
+
+            if cid not in comments:
+                continue
+
+            if cid not in mapped:
+                mapped[cid] = {
+                    "comment_id": cid,
+                    "comment_text": comments[cid]["comment_text"],
+                    "target_text": p["text"],
+                    "paragraph_index": p["paragraph_index"]
+                }
+
+    for cid, item in comments.items():
+        if cid not in mapped:
+            unmapped.append({
+                "comment_id": cid,
+                "comment_text": item["comment_text"],
+                "reason": "target_text_not_found"
+            })
+
+    return mapped, unmapped
+
+
+def classify_blocks(paragraphs: list[dict]) -> list[dict]:
+    if not paragraphs:
+        return []
+
+    quote_indices = []
+    for i, p in enumerate(paragraphs):
+        text = p["text"]
+        if "„" in text or '"' in text:
+            quote_indices.append(i)
+
+    last_idx = len(paragraphs) - 1
+    first_quote_idx = quote_indices[0] if quote_indices else None
+
+    blocks = []
+    counters = {
+        "title": 0,
+        "lead": 0,
+        "body_before_quote": 0,
+        "quote_block": 0,
+        "body_after_quote": 0,
+        "closing": 0
+    }
+
+    for i, p in enumerate(paragraphs):
+        if i == 0:
+            block_type = "title"
+        elif i == 1:
+            block_type = "lead"
+        elif i == last_idx:
+            block_type = "closing"
+        elif first_quote_idx is not None and i == first_quote_idx:
+            block_type = "quote_block"
+        elif first_quote_idx is not None and i < first_quote_idx:
+            block_type = "body_before_quote"
+        elif first_quote_idx is not None and i > first_quote_idx:
+            block_type = "body_after_quote"
+        else:
+            block_type = "body_before_quote"
+
+        counters[block_type] += 1
+
+        blocks.append({
+            "block_id": f"{block_type}_{counters[block_type]}",
+            "block_type": block_type,
+            "paragraph_index": p["paragraph_index"],
+            "original_text": p["text"],
+            "comments": [],
+            "element": p["element"]
+        })
+
+    return blocks
+
+
+def attach_comments_to_blocks(blocks: list[dict], mapped_comments: dict) -> list[dict]:
+    by_paragraph_index = {b["paragraph_index"]: b for b in blocks}
+
+    for _, comment in mapped_comments.items():
+        p_idx = comment["paragraph_index"]
+        if p_idx in by_paragraph_index:
+            by_paragraph_index[p_idx]["comments"].append({
+                "comment_id": comment["comment_id"],
+                "comment_text": comment["comment_text"],
+                "target_text": comment["target_text"]
+            })
+
+    return blocks
+
+
+def write_text_to_paragraph(paragraph_element, new_text: str):
     for r in paragraph_element.findall("w:r", NS):
         paragraph_element.remove(r)
 
-    run = etree.SubElement(
-        paragraph_element,
-        "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}r"
-    )
-
-    text_el = etree.SubElement(
-        run,
-        "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t"
-    )
-
+    run = etree.SubElement(paragraph_element, f"{{{W_NS}}}r")
+    text_el = etree.SubElement(run, f"{{{W_NS}}}t")
     text_el.text = new_text
 
 
-# -----------------------------
-# Apply revisions
-# -----------------------------
+def apply_revisions_to_blocks(blocks: list[dict], revisions: list[dict]) -> list[dict]:
+    blocks_by_id = {b["block_id"]: b for b in blocks}
 
-def rebuild_docx_xml(paragraphs):
+    for rev in revisions:
+        block_id = rev["block_id"]
+        revised_text = rev["revised_text"]
 
-    for block in paragraphs:
+        if block_id in blocks_by_id:
+            blocks_by_id[block_id]["revised_text"] = revised_text
 
-        revised = rewrite_with_gpt(block["text"])
-
-        write_text_to_paragraph(block["element"], revised)
-
-
-# -----------------------------
-# Save DOCX
-# -----------------------------
-
-def rebuild_docx(original_docx, xml_root, output_path):
-
-    with tempfile.TemporaryDirectory() as tmp:
-
-        with zipfile.ZipFile(original_docx) as z:
-            z.extractall(tmp)
-
-        xml_path = os.path.join(tmp, "word/document.xml")
-
-        with open(xml_path, "wb") as f:
-            f.write(etree.tostring(xml_root))
-
-        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as new_docx:
-
-            for folder, _, files in os.walk(tmp):
-
-                for file in files:
-
-                    full_path = os.path.join(folder, file)
-
-                    arcname = os.path.relpath(full_path, tmp)
-
-                    new_docx.write(full_path, arcname)
+    return blocks
 
 
-# -----------------------------
-# API endpoint
-# -----------------------------
+def rebuild_docx_xml(blocks: list[dict]):
+    for block in blocks:
+        if "revised_text" in block:
+            write_text_to_paragraph(block["element"], block["revised_text"])
 
-@app.route("/review-document", methods=["POST"])
 
-def review_document():
+# ----------------------------
+# Extract comments v2
+# ----------------------------
 
-    if "file" not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
+@app.post("/extract-comments")
+async def extract_comments(file: UploadFile = File(...)):
+    if not file.filename or not file.filename.lower().endswith(".docx"):
+        raise HTTPException(status_code=400, detail="INVALID_FILE_TYPE")
 
-    uploaded = request.files["file"]
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty DOCX file")
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as temp_input:
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as docx:
+            if "word/document.xml" not in docx.namelist():
+                raise HTTPException(status_code=400, detail="DOCX_PARSE_ERROR")
 
-        uploaded.save(temp_input.name)
+            document_xml = docx.read("word/document.xml")
+            doc_tree = etree.fromstring(document_xml)
 
-        xml_root = extract_docx_xml(temp_input.name)
+            comments = extract_comment_texts(docx)
 
-        paragraphs = collect_paragraphs(xml_root)
+            if not comments:
+                return {
+                    "ok": False,
+                    "warning": True,
+                    "error_code": "COMMENTS_NOT_FOUND",
+                    "message": "A dokumentumban nem található Word komment."
+                }
 
-        rebuild_docx_xml(paragraphs)
+            paragraphs = extract_paragraphs(doc_tree)
+            mapped_comments, unmapped_comments = extract_comment_targets(paragraphs, comments)
+            blocks = classify_blocks(paragraphs)
+            blocks = attach_comments_to_blocks(blocks, mapped_comments)
 
-        output_path = temp_input.name.replace(".docx", "_reviewed.docx")
+            for block in blocks:
+                block.pop("element", None)
 
-        rebuild_docx(temp_input.name, xml_root, output_path)
+            return {
+                "ok": True,
+                "status": "review_input",
+                "comments_found": len(comments),
+                "document_blocks": blocks,
+                "unmapped_comments": unmapped_comments
+            }
 
-        return send_file(
-            output_path,
-            as_attachment=True,
-            download_name="reviewed.docx"
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="DOCX_PARSE_ERROR")
+    except etree.XMLSyntaxError:
+        raise HTTPException(status_code=400, detail="DOCX_PARSE_ERROR")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"UNEXPECTED_ERROR: {str(e)}")
+
+
+# ----------------------------
+# Review payload schema
+# ----------------------------
+
+class ReviewRequest(BaseModel):
+    action: str
+    project: str
+    release_slug: str
+    review_round: int
+    status_in: str
+    status_out: str
+    source_file_name: str
+    target_file_name: str
+
+
+# ----------------------------
+# AI Revision schema
+# ----------------------------
+
+class RevisionItem(BaseModel):
+    block_id: str
+    comment_id: str
+    revised_text: str
+    change_type: str
+    review_comment: str
+
+
+class RebuildRequest(BaseModel):
+    revisions: List[RevisionItem]
+
+
+# ----------------------------
+# Review validation endpoint
+# ----------------------------
+
+@app.post("/review")
+def review_document(payload: ReviewRequest):
+    if payload.action != "review_document":
+        raise HTTPException(status_code=400, detail="Invalid action")
+
+    expected_input = f"{payload.release_slug}_c{payload.review_round}.docx"
+    expected_output = f"{payload.release_slug}_r{payload.review_round}.docx"
+
+    filename_valid = payload.source_file_name == expected_input
+    target_valid = payload.target_file_name == expected_output
+
+    return {
+        "ok": True,
+        "status": "review",
+        "message": "Review endpoint reached successfully.",
+        "release_slug": payload.release_slug,
+        "review_round": payload.review_round,
+        "status_in": payload.status_in,
+        "status_out": payload.status_out,
+        "source_file_name": payload.source_file_name,
+        "target_file_name": payload.target_file_name,
+        "expected_input_file_name": expected_input,
+        "expected_output_file_name": expected_output,
+        "filename_valid": filename_valid,
+        "target_valid": target_valid
+    }
+
+
+# ----------------------------
+# Rebuild document v1
+# Replaces full paragraph text by block_id and returns rebuilt DOCX
+# ----------------------------
+
+@app.post("/rebuild-document")
+async def rebuild_document(
+    file: UploadFile = File(...),
+    revisions_json: str = File(...)
+):
+    content = await file.read()
+
+    if not file.filename or not file.filename.lower().endswith(".docx"):
+        raise HTTPException(status_code=400, detail="INVALID_FILE_TYPE")
+
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty DOCX file")
+
+    if not revisions_json:
+        raise HTTPException(status_code=400, detail="Missing revisions_json")
+
+    try:
+        parsed = json.loads(revisions_json)
+        payload = RebuildRequest.model_validate(parsed)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"INVALID_REVISIONS_JSON: {str(e)}")
+
+    try:
+        input_zip_buffer = io.BytesIO(content)
+
+        with zipfile.ZipFile(input_zip_buffer, "r") as input_zip:
+            if "word/document.xml" not in input_zip.namelist():
+                raise HTTPException(status_code=400, detail="DOCX_PARSE_ERROR")
+
+            document_xml = input_zip.read("word/document.xml")
+            doc_tree = etree.fromstring(document_xml)
+
+            paragraphs = extract_paragraphs(doc_tree)
+            blocks = classify_blocks(paragraphs)
+            blocks = apply_revisions_to_blocks(
+                blocks,
+                [r.model_dump() for r in payload.revisions]
+            )
+            rebuild_docx_xml(blocks)
+
+            updated_document_xml = etree.tostring(
+                doc_tree,
+                xml_declaration=True,
+                encoding="UTF-8",
+                standalone="yes"
+            )
+
+            output_buffer = io.BytesIO()
+            with zipfile.ZipFile(output_buffer, "w", zipfile.ZIP_DEFLATED) as output_zip:
+                for item in input_zip.infolist():
+                    if item.filename == "word/document.xml":
+                        output_zip.writestr(item, updated_document_xml)
+                    else:
+                        output_zip.writestr(item, input_zip.read(item.filename))
+
+        output_buffer.seek(0)
+
+        return StreamingResponse(
+            output_buffer,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={
+                "Content-Disposition": f'attachment; filename="{file.filename}"'
+            }
         )
 
-
-# -----------------------------
-# Health check
-# -----------------------------
-
-@app.route("/health")
-
-def health():
-    return {"status": "ok"}
-
-
-# -----------------------------
-# Run
-# -----------------------------
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="DOCX_PARSE_ERROR")
+    except etree.XMLSyntaxError:
+        raise HTTPException(status_code=400, detail="DOCX_PARSE_ERROR")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"REVIEW_REBUILD_ERROR: {str(e)}")
