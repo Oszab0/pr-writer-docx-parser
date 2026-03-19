@@ -171,6 +171,44 @@ def attach_comments_to_blocks(blocks: list[dict], mapped_comments: dict) -> list
     return blocks
 
 
+def clear_paragraph_text(paragraph_element):
+    for t in paragraph_element.findall(".//w:t", NS):
+        t.text = ""
+
+
+def write_text_to_paragraph(paragraph_element, new_text: str):
+    text_nodes = paragraph_element.findall(".//w:t", NS)
+
+    if text_nodes:
+        text_nodes[0].text = new_text
+        for t in text_nodes[1:]:
+            t.text = ""
+    else:
+        run = etree.SubElement(paragraph_element, f"{{{NS['w']}}}r")
+        text_el = etree.SubElement(run, f"{{{NS['w']}}}t")
+        text_el.text = new_text
+
+
+def apply_revisions_to_blocks(blocks: list[dict], revisions: list[dict]) -> list[dict]:
+    blocks_by_id = {b["block_id"]: b for b in blocks}
+
+    for rev in revisions:
+        block_id = rev["block_id"]
+        revised_text = rev["revised_text"]
+
+        if block_id in blocks_by_id:
+            blocks_by_id[block_id]["revised_text"] = revised_text
+
+    return blocks
+
+
+def rebuild_docx_xml(blocks: list[dict]):
+    for block in blocks:
+        if "revised_text" in block:
+            clear_paragraph_text(block["element"])
+            write_text_to_paragraph(block["element"], block["revised_text"])
+
+
 # ----------------------------
 # Extract comments v2
 # ----------------------------
@@ -248,9 +286,8 @@ class ReviewRequest(BaseModel):
 # ----------------------------
 
 class RevisionItem(BaseModel):
+    block_id: str
     comment_id: str
-    original_text: str
-    editor_comment: str
     revised_text: str
     change_type: str
     review_comment: str
@@ -293,9 +330,8 @@ def review_document(payload: ReviewRequest):
 
 
 # ----------------------------
-# Rebuild document endpoint
-# Currently still stub:
-# validates revisions_json, then returns the original DOCX unchanged
+# Rebuild document v1
+# Replaces full paragraph text by block_id and returns rebuilt DOCX
 # ----------------------------
 
 @app.post("/rebuild-document")
@@ -305,6 +341,9 @@ async def rebuild_document(
 ):
     content = await file.read()
 
+    if not file.filename or not file.filename.lower().endswith(".docx"):
+        raise HTTPException(status_code=400, detail="INVALID_FILE_TYPE")
+
     if not content:
         raise HTTPException(status_code=400, detail="Empty DOCX file")
 
@@ -313,14 +352,58 @@ async def rebuild_document(
 
     try:
         parsed = json.loads(revisions_json)
-        RebuildRequest.model_validate(parsed)
+        payload = RebuildRequest.model_validate(parsed)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"INVALID_REVISIONS_JSON: {str(e)}")
 
-    return StreamingResponse(
-        io.BytesIO(content),
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={
-            "Content-Disposition": f'attachment; filename="{file.filename}"'
-        }
-    )
+    try:
+        input_zip = zipfile.ZipFile(io.BytesIO(content), "r")
+
+        if "word/document.xml" not in input_zip.namelist():
+            raise HTTPException(status_code=400, detail="DOCX_PARSE_ERROR")
+
+        document_xml = input_zip.read("word/document.xml")
+        doc_tree = etree.fromstring(document_xml)
+
+        paragraphs = extract_paragraphs(doc_tree)
+        blocks = classify_blocks(paragraphs)
+        blocks = apply_revisions_to_blocks(
+            blocks,
+            [r.model_dump() for r in payload.revisions]
+        )
+        rebuild_docx_xml(blocks)
+
+        updated_document_xml = etree.tostring(
+            doc_tree,
+            xml_declaration=True,
+            encoding="UTF-8",
+            standalone="yes"
+        )
+
+        output_buffer = io.BytesIO()
+        with zipfile.ZipFile(output_buffer, "w", zipfile.ZIP_DEFLATED) as output_zip:
+            for item in input_zip.infolist():
+                if item.filename == "word/document.xml":
+                    output_zip.writestr(item, updated_document_xml)
+                else:
+                    output_zip.writestr(item, input_zip.read(item.filename))
+
+        input_zip.close()
+        output_buffer.seek(0)
+
+        return StreamingResponse(
+            output_buffer,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={
+                "Content-Disposition": f'attachment; filename="{file.filename}"'
+            }
+        )
+
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="DOCX_PARSE_ERROR")
+    except etree.XMLSyntaxError:
+        raise HTTPException(status_code=400, detail="DOCX_PARSE_ERROR")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"REVIEW_REBUILD_ERROR: {str(e)}")
