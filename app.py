@@ -171,22 +171,13 @@ def attach_comments_to_blocks(blocks: list[dict], mapped_comments: dict) -> list
     return blocks
 
 
-def clear_paragraph_text(paragraph_element):
-    for t in paragraph_element.findall(".//w:t", NS):
-        t.text = ""
-
-
 def write_text_to_paragraph(paragraph_element, new_text: str):
-    text_nodes = paragraph_element.findall(".//w:t", NS)
+    for r in paragraph_element.findall("w:r", NS):
+        paragraph_element.remove(r)
 
-    if text_nodes:
-        text_nodes[0].text = new_text
-        for t in text_nodes[1:]:
-            t.text = ""
-    else:
-        run = etree.SubElement(paragraph_element, f"{{{NS['w']}}}r")
-        text_el = etree.SubElement(run, f"{{{NS['w']}}}t")
-        text_el.text = new_text
+    run = etree.SubElement(paragraph_element, f"{{{NS['w']}}}r")
+    text_el = etree.SubElement(run, f"{{{NS['w']}}}t")
+    text_el.text = new_text
 
 
 def apply_revisions_to_blocks(blocks: list[dict], revisions: list[dict]) -> list[dict]:
@@ -205,7 +196,6 @@ def apply_revisions_to_blocks(blocks: list[dict], revisions: list[dict]) -> list
 def rebuild_docx_xml(blocks: list[dict]):
     for block in blocks:
         if "revised_text" in block:
-            clear_paragraph_text(block["element"])
             write_text_to_paragraph(block["element"], block["revised_text"])
 
 
@@ -357,38 +347,38 @@ async def rebuild_document(
         raise HTTPException(status_code=400, detail=f"INVALID_REVISIONS_JSON: {str(e)}")
 
     try:
-        input_zip = zipfile.ZipFile(io.BytesIO(content), "r")
+        input_zip_buffer = io.BytesIO(content)
 
-        if "word/document.xml" not in input_zip.namelist():
-            raise HTTPException(status_code=400, detail="DOCX_PARSE_ERROR")
+        with zipfile.ZipFile(input_zip_buffer, "r") as input_zip:
+            if "word/document.xml" not in input_zip.namelist():
+                raise HTTPException(status_code=400, detail="DOCX_PARSE_ERROR")
 
-        document_xml = input_zip.read("word/document.xml")
-        doc_tree = etree.fromstring(document_xml)
+            document_xml = input_zip.read("word/document.xml")
+            doc_tree = etree.fromstring(document_xml)
 
-        paragraphs = extract_paragraphs(doc_tree)
-        blocks = classify_blocks(paragraphs)
-        blocks = apply_revisions_to_blocks(
-            blocks,
-            [r.model_dump() for r in payload.revisions]
-        )
-        rebuild_docx_xml(blocks)
+            paragraphs = extract_paragraphs(doc_tree)
+            blocks = classify_blocks(paragraphs)
+            blocks = apply_revisions_to_blocks(
+                blocks,
+                [r.model_dump() for r in payload.revisions]
+            )
+            rebuild_docx_xml(blocks)
 
-        updated_document_xml = etree.tostring(
-            doc_tree,
-            xml_declaration=True,
-            encoding="UTF-8",
-            standalone="yes"
-        )
+            updated_document_xml = etree.tostring(
+                doc_tree,
+                xml_declaration=True,
+                encoding="UTF-8",
+                standalone="yes"
+            )
 
-        output_buffer = io.BytesIO()
-        with zipfile.ZipFile(output_buffer, "w", zipfile.ZIP_DEFLATED) as output_zip:
-            for item in input_zip.infolist():
-                if item.filename == "word/document.xml":
-                    output_zip.writestr(item, updated_document_xml)
-                else:
-                    output_zip.writestr(item, input_zip.read(item.filename))
+            output_buffer = io.BytesIO()
+            with zipfile.ZipFile(output_buffer, "w", zipfile.ZIP_DEFLATED) as output_zip:
+                for item in input_zip.infolist():
+                    if item.filename == "word/document.xml":
+                        output_zip.writestr(item, updated_document_xml)
+                    else:
+                        output_zip.writestr(item, input_zip.read(item.filename))
 
-        input_zip.close()
         output_buffer.seek(0)
 
         return StreamingResponse(
