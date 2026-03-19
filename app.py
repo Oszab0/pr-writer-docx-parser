@@ -1,4 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List
 import zipfile
@@ -147,7 +148,14 @@ def review_document(payload: ReviewRequest):
         "filename_valid": filename_valid,
         "target_valid": target_valid
     }
-    
+
+
+# ----------------------------
+# Rebuild document endpoint
+# Currently returns the uploaded DOCX as a binary file response
+# so Make can pass it to Google Drive Upload as real file data
+# ----------------------------
+
 @app.post("/rebuild-document")
 async def rebuild_document(
     file: UploadFile = File(...),
@@ -161,10 +169,10 @@ async def rebuild_document(
     if not revisions_json:
         raise HTTPException(status_code=400, detail="Missing revisions_json")
 
-    return {
-        "ok": True,
-        "message": "Rebuild endpoint reached successfully.",
-        "input_file_name": file.filename,
-        "revisions_json_received": True,
-        "input_file_size": len(content)
-    }
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={
+            "Content-Disposition": f'attachment; filename="{file.filename}"'
+        }
+    )
